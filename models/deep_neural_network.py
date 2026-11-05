@@ -19,6 +19,17 @@ class DeepNeuralNetwork(BaseModel):
         patience=5,
         val_fraction=0.1
     ):
+        """
+        hidden_layers: tuple of ints specifying the number of hidden layers and neuron count per layer (e.g., (128, 64, 32)).
+        standardize: whether or not to standardize the data i.e. subtract mean and divide by std dev
+        lr: learning rate for the AdamW optimizer.
+        epochs: number of training passes over the dataset.
+        batch_size: mini-batch size for training.
+        patience: number of epochs without improvement before we stop training
+        dropout: dropout probability applied after each hidden layer.
+        seed: random seed for reproducibility.
+        val_fraction: percent of training data to use to decide early stopping
+        """
         self.seed = seed
         self.hidden_layers = hidden_layers
         self.standardize = standardize
