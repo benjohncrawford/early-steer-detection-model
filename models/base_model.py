@@ -1,5 +1,3 @@
-
-
 # Idea for the class is to serve largely as a wrapper around sklearn model classes 
 # Can extend functionality and also provide the same interface even for torch models
 class BaseModel:
