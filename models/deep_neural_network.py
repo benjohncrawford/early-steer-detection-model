@@ -22,11 +22,10 @@ class DeepNeuralNetwork(BaseModel):
         """
         hidden_layers: tuple of ints specifying the number of hidden layers and neuron count per layer (e.g., (128, 64, 32)).
         standardize: whether or not to standardize the data i.e. subtract mean and divide by std dev
-        lr: learning rate for the AdamW optimizer.
+        lr: learning rate for the Adam optimizer.
         epochs: number of training passes over the dataset.
         batch_size: mini-batch size for training.
         patience: number of epochs without improvement before we stop training
-        dropout: dropout probability applied after each hidden layer.
         seed: random seed for reproducibility.
         val_fraction: percent of training data to use to decide early stopping
         """
@@ -66,11 +65,8 @@ class DeepNeuralNetwork(BaseModel):
         """
         Fit the model for later predictions
 
-        x: numpy array or torch tensor of shape (n_samples, n_features)
-        Training vector, where n_samples is the number of samples and n_features is the number of features.
-
+        x: numpy array or torch tensor of shape (n_samples, n_features) or (n_samples, C, H, W)
         y: numpy array or torch tensor of shape (n_samples,)
-        Target vector relative to X.
         """
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
@@ -81,22 +77,23 @@ class DeepNeuralNetwork(BaseModel):
         self.classes_, y_idx = torch.unique(y_t, sorted=True, return_inverse=True)
         y_bin = y_idx.float().unsqueeze(1)
 
+        val_size = max(1, int(len(x_t) * self.val_fraction))
+        indices = torch.randperm(len(x_t))
+        val_idx, train_idx = indices[:val_size], indices[val_size:]
+
         if self.standardize:
-            self.mean_ = x_t.mean(dim=0, keepdim=True)
-            self.std_ = x_t.std(dim=0, keepdim=True) + 1e-8
+            # Standardize per-feature for 2D inputs, or per-channel across (N, H, W) for 4D inputs
+            norm_dims = 0 if x_t.ndim == 2 else (0, 2, 3)
+            self.mean_ = x_t[train_idx].mean(dim=norm_dims, keepdim=True)
+            self.std_ = x_t[train_idx].std(dim=norm_dims, keepdim=True) + 1e-8
             x_t = (x_t - self.mean_) / self.std_
+
+        x_train, y_train = x_t[train_idx], y_bin[train_idx]
+        x_val, y_val = x_t[val_idx], y_bin[val_idx]
 
         self.model = self._build_network(x_t.shape[1])
         criterion = nn.BCEWithLogitsLoss()
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
-
-        val_size = max(1, int(len(x_t) * self.val_fraction))
-        indices = torch.randperm(len(x_t))
-        val_idx, train_idx = indices[:val_size], indices[val_size:]
-        
-        x_train, y_train = x_t[train_idx], y_bin[train_idx]
-        x_val, y_val = x_t[val_idx], y_bin[val_idx]
-
 
         loader = DataLoader(
             TensorDataset(x_train, y_train),
@@ -109,6 +106,7 @@ class DeepNeuralNetwork(BaseModel):
         best_model_weights = copy.deepcopy(self.model.state_dict())
 
         for epoch in range(self.epochs):
+            self.model.train()
             running_train_loss = 0.0
             for batch_x, batch_y in loader:
                 optimizer.zero_grad()
@@ -116,7 +114,7 @@ class DeepNeuralNetwork(BaseModel):
                 loss.backward()
                 optimizer.step()
                 running_train_loss += loss.item()
-                
+
             avg_train_loss = running_train_loss / len(loader)
 
             self.model.eval()
@@ -132,17 +130,16 @@ class DeepNeuralNetwork(BaseModel):
             else:
                 epochs_without_improvement += 1
                 if epochs_without_improvement >= self.patience:
-
                     print(f"Early stopping triggered at epoch {epoch + 1}. Restoring best weights.")
-                    self.model.load_state_dict(best_model_weights)
                     break
 
+        self.model.load_state_dict(best_model_weights)
 
     def predict(self, x):
         """
         Predict class labels for samples in x.
 
-        x: numpy array or torch tensor of shape (n_samples, n_features)
+        x: numpy array or torch tensor of shape (n_samples, n_features) or (n_samples, C, H, W)
         """
         is_tensor = isinstance(x, torch.Tensor)
         x_t = self._to_tensor(x)
@@ -191,7 +188,7 @@ class DeepNeuralNetwork(BaseModel):
         """
         Return accuracy on provided data and labels.
 
-        x: numpy array or torch tensor of shape (n_samples, n_features)
+        x: numpy array or torch tensor of shape (n_samples, n_features) or (n_samples, C, H, W)
         y: numpy array or torch tensor of shape (n_samples,)
         """
         preds = self._to_tensor(self.predict(x))

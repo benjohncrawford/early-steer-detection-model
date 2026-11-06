@@ -1,1 +1,4 @@
 numeracy_prompts.txt
+train_indexes.txt
+test_indexes.txt
+**/__pycache__/
