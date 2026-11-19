@@ -1,443 +1,538 @@
-"""Generate SD3 Medium numeracy samples with 11 latent checkpoints and one RGB tensor.
+"""Generate SD3.5 Medium numeracy images and early block-20 features.
 
-========================================================================================
-ARCHITECTURAL & DATAFLOW OVERVIEW
-========================================================================================
-This script runs text-to-image inference using Stable Diffusion 3 Medium (SD3 Medium)
-over a list of text prompts to build a dataset for studying how visual numeracy
-(object counts, spatial layouts) emerges across denoising steps.
+Overview
+--------
+This script executes a deterministic, sharded generation pipeline over a 600-sample
+numeracy prompt manifest using Stability AI's Stable Diffusion 3.5 Medium
+(``stabilityai/stable-diffusion-3.5-medium``).
 
-For each prompt `index` (0, 1, 2, ...), the script produces three files named with a
-zero-padded 4-digit stem (`0000`, `0001`, ...):
+For each assigned prompt, the script produces three atomically written files under
+``<output-root>/cell-<CC>/<SSSS>.*``:
+    1. ``<SSSS>.safetensors``:
+       - 7 diffusion latent snapshots (``latent_000`` .. ``latent_050``, ``latent_100``),
+         each of shape ``(16, 128, 128)`` in ``bfloat16``.
+       - 6 intermediate transformer feature maps (``block20_000`` .. ``block20_050``),
+         each of shape ``(C, feature_size, feature_size)`` (``(1536, 48, 48)`` for
+         SD3.5 Medium with default settings) in ``bfloat16``.
+    2. ``<SSSS>.png``:
+       - Final 1024x1024 RGB image decoded by the VAE.
+    3. ``<SSSS>.json``:
+       - Provenance record capturing manifest metadata, generation hyperparameters,
+         VAE scale/shift factors, exact scheduler timesteps, tensor shapes, and
+         library versions.
 
-1. `{stem}.safetensors`: A dictionary of 12 PyTorch tensors saved on CPU:
-   - `latent_000`: Initial pure Gaussian noise tensor before any denoising occurs.
-     * Shape: `(16, 128, 128)` -> Channels-First `(C, H_latent, W_latent)`
-     * Dtype: `torch.float16` (half-precision floating point)
-   - `latent_010`, `latent_020`, ..., `latent_100` (10 tensors): Intermediate and final
-     denoised latent representations captured at 10%, 20%, ..., 100% of total steps.
-     * Shape: `(16, 128, 128)` -> Channels-First `(C, H_latent, W_latent)`
-     * Dtype: `torch.float16`
-   - `final_rgb`: The final VAE-decoded RGB image converted to a tensor.
-     * Shape: `(1024, 1024, 3)` -> Channels-Last `(H_image, W_image, C_rgb)`
-     * Dtype: `torch.uint8` (unsigned 8-bit integers in range `[0, 255]`)
-
-2. `{stem}.png`: Standard 24-bit RGB PNG image (`1024x1024` pixels) for visual inspection.
-
-3. `{stem}.json`: Complete provenance metadata (prompt, seed, scheduler class, software
-   versions, tensor shapes/dtypes, and per-checkpoint step/timestep logs).
-
-========================================================================================
-DIMENSION & LATENT SPACE GEOMETRY IN SD3 MEDIUM
-========================================================================================
-Unlike older Stable Diffusion models (SD 1.5 and SDXL) which use a 4-channel UNet latent
-space, SD3 Medium uses a Multimodal Diffusion Transformer (MMDiT) operating on a
-16-channel continuous VAE latent space:
-- Target RGB Resolution : `H_image = 1024`, `W_image = 1024`, `C_rgb = 3`
-- VAE Spatial Downscale : `pipe.vae_scale_factor = 8` (each 8x8 pixel patch -> 1 latent token)
-- Latent Spatial Size   : `H_latent = 1024 // 8 = 128`, `W_latent = 1024 // 8 = 128`
-- Latent Channel Count  : `pipe.transformer.config.in_channels = 16`
-- Batched Pipeline Shape: `(B, C, H_latent, W_latent) = (1, 16, 128, 128)` on GPU
-- Stored Tensor Shape   : `(C, H_latent, W_latent) = (16, 128, 128)` on CPU (batch dim sliced off)
-========================================================================================
+Parallelism & Fault Tolerance
+-----------------------------
+- The 600-row manifest is structured as 15 replicates of 40 canonical
+  ``(object_class, target_count)`` cells.
+- Work is sharded by ``index % num_shards == shard_id`` where ``num_shards`` divides
+  40, ensuring each worker owns a disjoint set of ``cell-XX`` directories with zero
+  write contention.
+- Existing outputs are validated for configuration consistency, PNG readability, and
+  complete ``.safetensors`` key sets before being skipped.
+- Writes go to ``*.partial.*`` temporary files first and are promoted via ``os.replace``
+  so preempted GPU jobs never leave corrupt final artifacts.
 """
 
-# Enables postponed evaluation of type annotations (PEP 563). Type hints like `dict[int, int]`
-# are stored as strings rather than evaluated at import time, improving startup speed and
-# forward-reference compatibility.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 from pathlib import Path
 
 
-# Hugging Face Hub repository identifier for Stable Diffusion 3 Medium in `diffusers` format.
-MODEL_ID = "stabilityai/stable-diffusion-3-medium-diffusers"
+# ---------------------------------------------------------------------------
+# Pipeline Constants
+# ---------------------------------------------------------------------------
 
-# Default path to the input text file containing prompts (one prompt per line).
-# - `Path(__file__).resolve()` gets the absolute path of this Python script, resolving symlinks.
-# - `.parent` navigates to the directory containing this script.
-# - `/ "Prompts" / "numeracy_smoke15.txt"` joins the subdirectory and filename.
-DEFAULT_PROMPTS = Path(__file__).resolve().parent / "Prompts" / "numeracy_smoke15.txt"
+# Hugging Face Hub identifier for Stable Diffusion 3.5 Medium (MMDiT-X, 24 blocks,
+# 16 latent channels, patch_size=2, 24 attention heads * 64 dim = 1536 channels).
+MODEL_ID = "stabilityai/stable-diffusion-3.5-medium"
+
+# Denoising progress checkpoints (%) at which transformer block features are captured.
+# Because features are hooked *during* the forward pass of the step starting at that
+# progress point, 0% captures the model's very first pass over pure noise and 50%
+# captures the pass immediately after 50% of denoising steps have completed.
+EARLY_PERCENTAGES = (0, 10, 20, 30, 40, 50)
+
+# Denoising progress checkpoints (%) at which scheduler latents are saved.
+# Includes 0% (initial Gaussian noise) through 50% (early trajectory) plus 100%
+# (final denoised latent right before VAE decoding).
+LATENT_PERCENTAGES = EARLY_PERCENTAGES + (100,)
+
+# Total number of distinct (object_class, target_count) experimental cells:
+# 10 object classes x 4 target counts {3, 4, 5, 6} = 40 cells.
+SHARDS = 40  # Ten object classes times four requested counts.
 
 
-def checkpoint_steps(num_steps: int) -> dict[int, int]:
-    """Map 1-based completed denoising step counts to target decile percentages (10..100).
+def read_manifest(path: Path) -> list[dict]:
+    """Load and strictly validate the 600-row numeracy prompt manifest CSV.
 
-    Because the total number of inference steps (`num_steps`) may not be a multiple of 10,
-    this function computes which completed step index (`1 <= step <= num_steps`) corresponds
-    closest to each 10% increment (10%, 20%, ..., 100%) using integer round-half-up arithmetic.
+    Expected CSV layout
+    -------------------
+    - Exactly 600 rows ordered as 15 contiguous blocks (replicates 0..14) of 40 rows.
+    - Required columns: ``id``, ``prompt``, ``object_class``, ``target_count``,
+      ``replicate``, ``seed``.
+    - Row ``i`` must satisfy:
+        * ``id == f"{i:04d}"``
+        * ``replicate == i // 40``
+        * ``(object_class, target_count)`` identical to row ``i % 40``
+        * ``target_count in {3, 4, 5, 6}``
+        * ``seed`` unique across all 600 rows and within signed 64-bit range ``[0, 2**63)``
 
-    Mathematical Formulation:
-        For each `percent` in `{10, 20, 30, 40, 50, 60, 70, 80, 90, 100}`:
-            exact_step = (percent / 100.0) * num_steps
-            rounded_step = floor(exact_step + 0.5)
-                         = (percent * num_steps + 50) // 100
+    Parameters
+    ----------
+    path : Path
+        Filesystem path to the input CSV manifest.
 
-        Adding 50 before integer floor-division by 100 is equivalent to adding 0.5 before
-        truncating, implementing standard round-half-up without floating-point inaccuracies.
+    Returns
+    -------
+    list[dict]
+        Parsed list of 600 validated sample dictionaries, each containing:
+        ``{"id": str, "prompt": str, "object_class": str, "target_count": int,
+           "replicate": int, "seed": int}``.
 
-    Worked Examples:
-        1. `num_steps = 30` (divisible by 10):
-           - 10%: `(10 * 30 + 50) // 100 = 350 // 100 = 3`  -> `{3: 10}`
-           - 20%: `(20 * 30 + 50) // 100 = 650 // 100 = 6`  -> `{6: 20}`
-           - ...
-           - 100%: `(100 * 30 + 50) // 100 = 3050 // 100 = 30` -> `{30: 100}`
-           Result: `{3: 10, 6: 20, 9: 30, 12: 40, 15: 50, 18: 60, 21: 70, 24: 80, 27: 90, 30: 100}`
-
-        2. `num_steps = 25` (not divisible by 10):
-           - 10%: `(10 * 25 + 50) // 100 = 300 // 100 = 3` (exact is 2.5 -> rounds up to 3)
-           - 20%: `(20 * 25 + 50) // 100 = 550 // 100 = 5` (exact is 5.0 -> 5)
-
-    Why `num_steps >= 10` is required:
-        By the Pigeonhole Principle, if `num_steps < 10`, two different decile percentages
-        would map to the same integer step count, overwriting a dictionary key and yielding
-        fewer than 10 post-start checkpoints (fewer than 11 total checkpoints including 0%).
-
-    Args:
-        num_steps: Total number of denoising steps configured for the scheduler (`>= 10`).
-
-    Returns:
-        dict[int, int]: Dictionary where:
-            - Key (`int`): 1-based completed step number in `[1, num_steps]`.
-            - Value (`int`): Corresponding nominal percentage in `{10, 20, ..., 100}`.
-             Note: The 0% checkpoint (`latent_000`) is captured prior to the denoising loop
-            and is therefore not included in this lookup table.
+    Raises
+    ------
+    ValueError
+        If columns are missing, rows are malformed/out-of-range, seeds collide,
+        or the 40-cell cyclic ordering invariant is violated.
     """
-    if num_steps < 10:
-        raise ValueError("--steps must be at least 10 to yield 11 distinct checkpoints")
+    # Use "utf-8-sig" to transparently strip any UTF-8 BOM from spreadsheet exports.
+    with path.open("r", encoding="utf-8-sig", newline="") as stream:
+        reader = csv.DictReader(stream)
+        required = {"id", "prompt", "object_class", "target_count", "replicate", "seed"}
+        if not required.issubset(reader.fieldnames or []):
+            raise ValueError(f"Manifest missing columns: {sorted(required - set(reader.fieldnames or []))}")
 
-    # `range(10, 101, 10)` generates the 10 decile integers: 10, 20, 30, 40, 50, 60, 70, 80, 90, 100.
-    return {(percent * num_steps + 50) // 100: percent for percent in range(10, 101, 10)}
+        samples = []
+        for index, row in enumerate(reader):
+            # DictReader places overflow columns under key `None` and missing cells as `None`.
+            if None in row or any(row.get(field) in (None, "") for field in required):
+                raise ValueError(f"Malformed manifest row {index + 2}")
+
+            sample = {
+                "id": row["id"],
+                "prompt": row["prompt"].strip(),
+                "object_class": row["object_class"].strip(),
+                "target_count": int(row["target_count"]),
+                "replicate": int(row["replicate"]),
+                "seed": int(row["seed"]),
+            }
+
+            # Validate field-level invariants; seed must fit in signed int64 for torch.Generator.
+            if (sample["id"] != f"{index:04d}" or not sample["prompt"]
+                    or not sample["object_class"] or sample["target_count"] not in (3, 4, 5, 6)
+                    or sample["replicate"] < 0 or not 0 <= sample["seed"] < 2**63):
+                raise ValueError(f"Invalid manifest row {index + 2}: {sample}")
+            samples.append(sample)
+
+    # Validate global dataset cardinality and seed uniqueness.
+    if len(samples) != 600 or len({row["seed"] for row in samples}) != 600:
+        raise ValueError("Expected exactly 600 samples with unique seeds")
+
+    # Verify exactly 40 distinct (object_class, target_count) cells exist.
+    cells = {(row["object_class"], row["target_count"]) for row in samples}
+    if len(cells) != SHARDS:
+        raise ValueError(f"Expected {SHARDS} distinct object/count cells, found {len(cells)}")
+
+    # Verify strict cyclic layout so `index % 40` always maps to the same experimental cell
+    # and `index // 40` always equals the replicate index.
+    for index, sample in enumerate(samples):
+        if sample["replicate"] != index // SHARDS:
+            raise ValueError(f"Manifest order does not match 40-cell sharding at {sample['id']}")
+        if (sample["object_class"], sample["target_count"]) != (
+            samples[index % SHARDS]["object_class"], samples[index % SHARDS]["target_count"]
+        ):
+            raise ValueError(f"Manifest cell order changes at {sample['id']}")
+
+    return samples
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse and return command-line interface (CLI) arguments.
-
-    CLI Flags:
-        --prompts        : Path to UTF-8 text file with one prompt per line.
-        --output-dir     : Directory where `.safetensors`, `.png`, and `.json` files are written.
-        --steps          : Number of Euler flow-matching denoising steps (default: 30).
-        --guidance-scale : Classifier-Free Guidance (CFG) scale controlling prompt adherence
-                           (default: 7.0). Higher values increase prompt alignment at the cost
-                           of diversity/saturation.
-        --seed           : Base PRNG seed for prompt 0 (`index = 0`). Prompt `index` uses
-                           `seed + index` for deterministic, reproducible generation.
-        --limit          : Optional cap on how many prompts from the file to process.
-        --overwrite      : Boolean flag; if omitted (`False`), existing completed samples are
-                           skipped to allow seamless job resumption.
-    """
+    """Parse command-line arguments controlling model sampling, hooks, and sharding."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--prompts", type=Path, default=DEFAULT_PROMPTS)
-    parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--steps", type=int, default=30)
-    parser.add_argument("--guidance-scale", type=float, default=7.0)
     parser.add_argument(
-        "--seed",
-        type=int,
-        default=20261104,
-        help="Seed for the first prompt; subsequent prompts use seed + index",
+        "--manifest", type=Path, default=Path("prompts/numeracy_smoke_v3.csv"),
+        help="Path to the 600-row numeracy CSV manifest.",
     )
-    parser.add_argument("--limit", type=int, default=None, help="Optional number of prompts to process")
-    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--output-root", type=Path, required=True,
+        help="Root directory where cell-XX subdirectories will be created.",
+    )
+    parser.add_argument(
+        "--steps", type=int, default=40,
+        help="Total denoising steps; must be a positive multiple of 10 so 10% checkpoints are exact.",
+    )
+    parser.add_argument(
+        "--guidance-scale", type=float, default=4.5,
+        help="Classifier-Free Guidance (CFG) scale; must be > 1.0 to enable dual-branch CFG.",
+    )
+    parser.add_argument(
+        "--block", type=int, default=20,
+        help="Zero-based MMDiT transformer block index to hook (0..23 for SD3.5 Medium).",
+    )
+    parser.add_argument(
+        "--feature-size", type=int, default=48,
+        help="Target spatial height and width for bilinear-resized block features (native grid is 64x64).",
+    )
+    parser.add_argument(
+        "--limit", type=int, default=600,
+        help="First N manifest rows; used for a pilot",
+    )
+    parser.add_argument(
+        "--shard-id", type=int, required=True,
+        help="Zero-based worker shard index in [0, num_shards).",
+    )
+    parser.add_argument(
+        "--num-shards", type=int, default=SHARDS,
+        help="Parallel worker count; must divide 40",
+    )
+    parser.add_argument(
+        "--replicate-start", type=int, default=0,
+        help="Inclusive replicate index for checkpointed runs",
+    )
+    parser.add_argument(
+        "--replicate-end", type=int, default=15,
+        help="Exclusive replicate index for checkpointed runs",
+    )
+    parser.add_argument(
+        "--overwrite", action="store_true",
+        help="Re-run and overwrite existing artifacts even if valid files already exist.",
+    )
     return parser.parse_args()
 
 
+def expected_settings(sample: dict, args: argparse.Namespace) -> dict:
+    """Build the canonical configuration fingerprint for a single sample.
+
+    Used both to populate the output ``.json`` metadata and to detect parameter
+    drift when resuming an interrupted run into an existing ``--output-root``.
+    """
+    return {
+        **sample,
+        "model_id": MODEL_ID,
+        "num_inference_steps": args.steps,
+        "guidance_scale": args.guidance_scale,
+        "feature_block": args.block,
+        "feature_spatial_size": args.feature_size,
+        "feature_percentages": list(EARLY_PERCENTAGES),
+        "latent_percentages": list(LATENT_PERCENTAGES),
+        "latent_dtype": "torch.bfloat16",
+    }
+
+
 def main() -> None:
-    """Execute end-to-end prompt loading, SD3 pipeline initialization, inference, and serialization."""
-    # -------------------------------------------------------------------------
-    # STEP 1: Fast CLI Validation & Prompt Loading (Before Heavy ML Imports)
-    # -------------------------------------------------------------------------
+    """Run sharded SD3.5 Medium inference with latent and block-feature extraction."""
+    # -----------------------------------------------------------------------
+    # 1. Argument Validation & Shard Assignment (CPU-only, fast fail)
+    # -----------------------------------------------------------------------
     args = parse_args()
 
-    # Pre-calculate the `{completed_step_count: percent}` lookup dictionary.
-    # Validates `args.steps >= 10` immediately before loading weights.
-    checkpoints = checkpoint_steps(args.steps)
+    # Percentage checkpoints are multiples of 10% (0, 10, ..., 50, 100), so `steps`
+    # must divide cleanly by 10 to land on exact integer step indices.
+    if args.steps < 10 or args.steps % 10:
+        raise ValueError("--steps must be a multiple of 10")
 
-    if args.limit is not None and args.limit < 1:
-        raise ValueError("--limit must be positive")
-    if not args.prompts.is_file():
-        raise FileNotFoundError(args.prompts)
+    # Diffusers only batches [unconditional, conditional] when CFG is active (> 1.0).
+    # The forward hook relies on `image_tokens.shape[0] == 2` to slice index 1.
+    if args.guidance_scale <= 1:
+        raise ValueError("Guidance scale must exceed 1 to capture the conditional CFG branch")
 
-    # Read the prompt file:
-    # - `encoding="utf-8-sig"` decodes UTF-8 and automatically strips any leading Byte Order Mark
-    #   (BOM, `\ufeff`) that Windows text editors often insert at the start of text files.
-    # - `.splitlines()` splits on `\n`, `\r\n`, or `\r` without retaining newline characters.
-    # - `if line.strip()` filters out blank or whitespace-only lines.
-    # - `line.strip()` removes leading/trailing spaces from each valid prompt.
-    prompts = [
-        line.strip()
-        for line in args.prompts.read_text(encoding="utf-8-sig").splitlines()
-        if line.strip()
+    if args.feature_size < 4 or not 1 <= args.limit <= 600:
+        raise ValueError("Invalid feature size or limit")
+
+    # Enforcing `40 % num_shards == 0` guarantees every cell-XX directory belongs
+    # exclusively to one shard across all replicates.
+    if (args.num_shards < 1 or SHARDS % args.num_shards
+            or not 0 <= args.shard_id < args.num_shards):
+        raise ValueError("Shard count must divide 40 and shard ID must be in range")
+
+    if not 0 <= args.replicate_start < args.replicate_end <= 15:
+        raise ValueError("Replicate range must satisfy 0 <= start < end <= 15")
+
+    samples = read_manifest(args.manifest)
+
+    # Filter manifest to this worker's shard, pilot limit, and replicate window.
+    # Each entry is `(global_manifest_index, sample_dict)`.
+    assigned = [
+        (index, sample) for index, sample in enumerate(samples[:args.limit])
+        if index % args.num_shards == args.shard_id
+        and args.replicate_start <= sample["replicate"] < args.replicate_end
     ]
+    if not assigned:
+        print(f"Shard {args.shard_id} has no samples under limit {args.limit}", flush=True)
+        return
 
-    # Slice the prompt list if `--limit N` was provided.
-    # Indexing: `prompts[: args.limit]` selects elements at indices `0, 1, ..., min(len(prompts), limit) - 1`.
-    if args.limit is not None:
-        prompts = prompts[: args.limit]
-    if not prompts:
-        raise ValueError("No prompts found")
-
-    # -------------------------------------------------------------------------
-    # STEP 2: Lazy Import of Heavy Deep Learning Libraries & GPU Setup
-    # -------------------------------------------------------------------------
-    # Placed after argument/file validation so `--help` or invalid CLI invocations fail
-    # instantaneously without waiting several seconds to import PyTorch, Diffusers, and CUDA.
-    import numpy as np
+    # -----------------------------------------------------------------------
+    # 2. Lazy Heavy Imports & Pipeline Initialization on GPU
+    # -----------------------------------------------------------------------
+    # Defer importing PyTorch/Diffusers until validation and sharding succeed so
+    # invalid invocations or empty pilot shards exit immediately.
     import torch
     from diffusers import StableDiffusion3Pipeline
+    from PIL import Image
+    from safetensors import safe_open
     from safetensors.torch import save_file
+    from torch.nn import functional as F
 
-    # Enforce GPU execution (SD3 Medium has ~2B parameters in its MMDiT + T5-XXL/CLIP text encoders).
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is unavailable; run this inside a Delta A100 GPU allocation")
+        raise RuntimeError("CUDA is unavailable; run inside a Delta GPU allocation")
 
-    # Create target output directory (and any missing parent directories) if not already present.
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Log the active CUDA device name (index 0 = first visible GPU allocated to the job).
     print(f"Loading {MODEL_ID} on {torch.cuda.get_device_name(0)}", flush=True)
-
-    # Load all SD3 Medium components (3 text encoders: CLIP-L, CLIP-G, T5-XXL; MMDiT transformer;
-    # FlowMatchEulerDiscreteScheduler; and 16-channel VAE) in FP16 (`torch.float16`) to halve VRAM usage
-    # and utilize Tensor Core acceleration.
-    pipe = StableDiffusion3Pipeline.from_pretrained(MODEL_ID, torch_dtype=torch.float16)
+    pipe = StableDiffusion3Pipeline.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16)
     pipe.to("cuda")
-
-    # Disable the per-step `tqdm` console progress bar to keep batch/SLURM log files clean.
     pipe.set_progress_bar_config(disable=True)
 
-    # -------------------------------------------------------------------------
-    # STEP 3: Verify Latent Space Geometry `(C, H_latent, W_latent)`
-    # -------------------------------------------------------------------------
-    # Compute expected unbatched 3D latent shape for a 1024x1024 image:
-    # - `pipe.transformer.config.in_channels` = 16 latent channels
-    # - `pipe.vae_scale_factor` = 8 spatial downsampling factor
-    # - `1024 // 8` = 128 latent height and 128 latent width
-    # Resulting tuple: `(16, 128, 128)` representing `(Channels, Height, Width)`.
-    latent_shape = (
-        int(pipe.transformer.config.in_channels),
-        1024 // pipe.vae_scale_factor,
-        1024 // pipe.vae_scale_factor,
-    )
-    if latent_shape != (16, 128, 128):
-        raise RuntimeError(f"Unexpected latent shape: {latent_shape}")
+    # Access the MMDiT-X transformer block stack (24 JointTransformerBlock layers for SD3.5-M).
+    blocks = pipe.transformer.transformer_blocks
+    if not 0 <= args.block < len(blocks):
+        raise ValueError(f"Block {args.block} unavailable; model has {len(blocks)} blocks")
 
-    steps_to_percent = checkpoints
+    # -----------------------------------------------------------------------
+    # 3. Verify Latent & Patch-Token Geometry
+    # -----------------------------------------------------------------------
+    # For SD3.5 Medium at 1024x1024:
+    #   - latent_channels = 16
+    #   - vae_scale_factor = 8  -> latent_height = latent_width = 1024 // 8 = 128
+    #   - latent_shape = (16, 128, 128)
+    #   - patch_size = 2        -> token_height = token_width = 128 // 2 = 64
+    #   - flattened image token count = 64 * 64 = 4096 tokens
+    latent_channels = int(pipe.transformer.config.in_channels)
+    patch = int(pipe.transformer.config.patch_size)
+    latent_height = 1024 // pipe.vae_scale_factor
+    latent_width = 1024 // pipe.vae_scale_factor
+    latent_shape = (latent_channels, latent_height, latent_width)
+    if latent_shape != (16, 128, 128) or latent_height % patch or latent_width % patch:
+        raise RuntimeError(f"Unexpected model latent/patch configuration: {latent_shape}, patch={patch}")
+    token_height, token_width = latent_height // patch, latent_width // patch
 
-    # -------------------------------------------------------------------------
-    # STEP 4: Main Generation Loop Over Prompts
-    # -------------------------------------------------------------------------
-    # `enumerate(prompts)` yields `(index, prompt)` where `index` is 0-based (`0, 1, ..., len(prompts)-1`).
-    for index, prompt in enumerate(prompts):
-        # Format 0-based `index` as a 4-digit zero-padded string (`0 -> "0000"`, `14 -> "0014"`).
-        stem = f"{index:04d}"
-        tensor_path = args.output_dir / f"{stem}.safetensors"
-        png_path = args.output_dir / f"{stem}.png"
-        metadata_path = args.output_dir / f"{stem}.json"
+    # -----------------------------------------------------------------------
+    # 4. Precompute Step-to-Percentage Lookup Maps & Expected Tensor Keys
+    # -----------------------------------------------------------------------
+    # For default args.steps == 40:
+    #   - hook_steps (0-indexed forward call index -> percent completed BEFORE step):
+    #       {0: 0, 4: 10, 8: 20, 12: 30, 16: 40, 20: 50}
+    #   - latent_steps (1-indexed completed step count -> percent completed AFTER step):
+    #       {4: 10, 8: 20, 12: 30, 16: 40, 20: 50, 40: 100}
+    #     (0% latent is captured directly before inference starts.)
+    hook_steps = {percent * args.steps // 100: percent for percent in EARLY_PERCENTAGES}
+    latent_steps = {percent * args.steps // 100: percent for percent in LATENT_PERCENTAGES[1:]}
 
-        # Checkpoint / Resume Guard:
-        # If `--overwrite` is False and all three output artifacts already exist on disk,
-        # skip this prompt. Because `.safetensors` is written atomically via `.partial.safetensors`
-        # and `metadata_path` is written last, all three existing guarantees the prior run completed.
-        if not args.overwrite and all(path.exists() for path in (tensor_path, png_path, metadata_path)):
-            print(f"[{index + 1}/{len(prompts)}] skipping {stem}", flush=True)
-            continue
+    # Exact set of 13 keys expected inside each `.safetensors` archive:
+    #   7 latents:  latent_000, latent_010, latent_020, latent_030, latent_040, latent_050, latent_100
+    #   6 features: block20_000, block20_010, block20_020, block20_030, block20_040, block20_050
+    expected_keys = {f"latent_{percent:03d}" for percent in LATENT_PERCENTAGES}
+    expected_keys |= {f"block{args.block:02d}_{percent:03d}" for percent in EARLY_PERCENTAGES}
 
-        # Derive a unique, deterministic seed for this prompt index.
-        seed = args.seed + index
-        generator = torch.Generator(device="cuda").manual_seed(seed)
+    # -----------------------------------------------------------------------
+    # 5. Per-Sample Generation & Feature Extraction Loop
+    # -----------------------------------------------------------------------
+    for position, (index, sample) in enumerate(assigned, start=1):
+        stem = sample["id"]  # Zero-padded 4-digit sample ID, e.g., "0042"
+        cell_dir = args.output_root / f"cell-{index % SHARDS:02d}"
+        cell_dir.mkdir(parents=True, exist_ok=True)
+        tensor_path = cell_dir / f"{stem}.safetensors"
+        png_path = cell_dir / f"{stem}.png"
+        metadata_path = cell_dir / f"{stem}.json"
 
-        # ---------------------------------------------------------------------
-        # STEP 4A: Sample Initial Gaussian Noise (`latent_000`, 0% Checkpoint)
-        # ---------------------------------------------------------------------
-        # `pipe.prepare_latents` samples standard normal noise `N(0, I)` on the GPU using `generator`.
-        #
-        # Dimension & Indexing Details:
-        # - `initial` has 4D batched shape `(batch_size, C, H_latent, W_latent)` = `(1, 16, 128, 128)`
-        #   in `NCHW` layout, dtype `torch.float16`, residing on `"cuda:0"`.
+        # 5a. Resume & Consistency Guard
+        # Prevent silent mixing of incompatible runs in the same output root.
+        settings = expected_settings(sample, args)
+        if metadata_path.exists():
+            old = json.loads(metadata_path.read_text(encoding="utf-8"))
+            mismatches = [key for key, value in settings.items() if old.get(key) != value]
+            if mismatches and not args.overwrite:
+                raise ValueError(f"{stem} settings differ ({', '.join(mismatches)}); use a new output root")
+
+        # Skip sample only if all three artifacts exist, are non-empty, the PNG decodes
+        # cleanly, and the safetensors archive contains the exact expected key set.
+        if not args.overwrite and all(path.is_file() and path.stat().st_size > 0
+                                      for path in (tensor_path, png_path, metadata_path)):
+            try:
+                with Image.open(png_path) as image:
+                    image.verify()
+                with safe_open(str(tensor_path), framework="pt", device="cpu") as handle:
+                    valid = set(handle.keys()) == expected_keys
+                if valid:
+                    print(f"[{position}/{len(assigned)}] skipping {stem}", flush=True)
+                    continue
+            except (OSError, ValueError):
+                # Corrupt or truncated file; fall through and regenerate cleanly.
+                pass
+
+        # 5b. Deterministic Initial Noise Preparation (0% Latent)
+        # Seed a CUDA-side generator so initial Gaussian noise `initial` has shape
+        # (1, 16, 128, 128) in bfloat16 and is reproducible for this sample's seed.
+        generator = torch.Generator(device="cuda").manual_seed(sample["seed"])
         initial = pipe.prepare_latents(
             batch_size=1,
-            num_channels_latents=latent_shape[0],  # Index 0 of `(16, 128, 128)` -> 16 channels
+            num_channels_latents=latent_channels,
             height=1024,
             width=1024,
-            dtype=pipe.transformer.dtype,          # `torch.float16`
+            dtype=pipe.transformer.dtype,
             device=torch.device("cuda"),
             generator=generator,
         )
+        if tuple(initial.shape) != (1, *latent_shape) or initial.dtype != torch.bfloat16:
+            raise RuntimeError(f"Unexpected initial latent: {initial.shape}, {initial.dtype}")
 
-        # Store the 0% checkpoint (`latent_000`) before denoising starts:
-        # - `initial[0]` indexes the 0-th element along axis 0 (the batch dimension `B=1`),
-        #   reducing the 4D tensor `(1, 16, 128, 128)` to a 3D tensor `(16, 128, 128)`.
-        # - `.detach()` strips any autograd computation graph tracking.
-        # - `.to("cpu")` copies the tensor from GPU VRAM to host system RAM. Crucially, this
-        #   creates an independent copy so subsequent in-place scheduler updates on GPU do not
-        #   mutate `latent_000`.
-        # - `.contiguous()` guarantees a dense, row-major (C-contiguous) memory layout, which
-        #   is strictly required by `safetensors.torch.save_file`.
-        tensors = {"latent_000": initial[0].detach().to("cpu").contiguous()}
+        # Strip batch dim -> store shape (16, 128, 128) on CPU as `latent_000`.
+        tensors = {"latent_000": initial[0].detach().cpu().contiguous()}
+        snapshots = [{"percent": 0, "completed_steps": 0, "latent_scheduler_timestep": None}]
+        feature_timesteps: dict[int, float] = {}
+        hook_calls = 0
 
-        # Initialize the chronological list of checkpoint metadata records with the 0% state.
-        # Before step 1 begins, 0 steps are completed and no scheduler timestep has been applied yet.
-        snapshots = [
-            {
-                "requested_percent": 0,
-                "completed_steps": 0,
-                "actual_percent": 0.0,
-                "scheduler_timestep": None,
-            }
-        ]
+        # 5c. Forward Hook on Transformer Block (Captures Conditional Image Features)
+        def capture_block(_module, _inputs, output):
+            """Intercept `blocks[args.block]` output during each denoising forward pass.
 
-        # ---------------------------------------------------------------------
-        # STEP 4B: Define Per-Step Callback to Capture 10%..100% Latents
-        # ---------------------------------------------------------------------
-        def record_step(_pipeline, step_index, timestep, callback_kwargs):
-            """Hook invoked by `StableDiffusion3Pipeline` at the end of every denoising step.
-
-            Args:
-                _pipeline: Reference to the active `StableDiffusion3Pipeline` instance (unused).
-                step_index (int): 0-based index of the step that just finished (`0` to `args.steps - 1`).
-                timestep (torch.Tensor): 0D scalar tensor representing the continuous flow-matching
-                    scheduler timestep (starts at `1000.0` at pure noise and decreases toward `0.0`).
-                callback_kwargs (dict): Dictionary containing state tensors requested via
-                    `callback_on_step_end_tensor_inputs=["latents"]`.
-                    - `callback_kwargs["latents"]` has shape `(1, 16, 128, 128)` on `"cuda:0"`.
-
-            Returns:
-                dict: `callback_kwargs` (must be returned so the pipeline loop can continue).
+            Dimensions through this hook (for SD3.5 Medium, default feature_size=48):
+              output              : tuple(text_tokens, image_tokens)
+              image_tokens        : (2, 4096, 1536)       [uncond, cond], bfloat16
+              image_tokens[1]     : (4096, 1536)          conditional branch only
+              .transpose(0, 1)    : (1536, 4096)          channels-first
+              .reshape(...)       : (1, 1536, 64, 64)     2D spatial patch grid (NCHW)
+              F.interpolate(...)  : (1, 1536, 48, 48)     bilinear-resized, float32
+              stored tensor       : (1536, 48, 48)        CHW on CPU, bfloat16, contiguous
             """
-            # Convert 0-based `step_index` (`0 .. steps-1`) to 1-based completed step count (`1 .. steps`).
-            completed = step_index + 1
+            nonlocal hook_calls
+            step_index = hook_calls
+            hook_calls += 1
 
-            # Check if this completed step corresponds to one of our 10 target deciles (10%..100%).
-            if completed in steps_to_percent:
-                percent = steps_to_percent[completed]
+            # Ignore steps not in the early percentage schedule.
+            if step_index not in hook_steps:
+                return
 
-                # Format key as `latent_010`, `latent_020`, ..., `latent_100`.
-                # Indexing `callback_kwargs["latents"][0]` slices off batch dimension `B=1`:
-                # `(1, 16, 128, 128)` on GPU -> `(16, 128, 128)` copied to CPU RAM.
+            percent = hook_steps[step_index]
+
+            # JointTransformerBlock returns `(encoder_hidden_states, hidden_states)`,
+            # i.e. `(text_tokens, image_tokens)`.
+            if not isinstance(output, tuple) or len(output) != 2:
+                raise RuntimeError(f"Block output is not a (text, image) tuple at step {step_index}")
+
+            image_tokens = output[1]
+            # Confirm CFG batch size == 2 and spatial token count == 64 * 64 == 4096.
+            if (image_tokens.ndim != 3 or image_tokens.shape[0] != 2
+                    or image_tokens.shape[1] != token_height * token_width):
+                raise RuntimeError(f"Unexpected block image-token shape: {tuple(image_tokens.shape)}")
+
+            # Diffusers CFG ordering is [unconditional, conditional]. Keep only
+            # the prompt-conditioned branch and preserve the spatial token grid.
+            channels = image_tokens.shape[2]  # 1536 for SD3.5 Medium
+            feature_map = image_tokens[1].transpose(0, 1).reshape(
+                1, channels, token_height, token_width
+            )
+
+            # Upcast to float32 for accurate bilinear interpolation from (64, 64) -> (48, 48).
+            feature_map = F.interpolate(
+                feature_map.float(), size=(args.feature_size, args.feature_size),
+                mode="bilinear", align_corners=False,
+            )
+
+            # Remove dummy batch dim, downcast back to bfloat16, and offload to CPU memory.
+            tensors[f"block{args.block:02d}_{percent:03d}"] = (
+                feature_map[0].to(torch.bfloat16).detach().cpu().contiguous()
+            )
+            # Record the exact FlowMatchEulerDiscreteScheduler timestep fed into this step.
+            feature_timesteps[percent] = float(pipe.scheduler.timesteps[step_index])
+
+        # 5d. Step-End Callback (Captures Intermediate & Final Scheduler Latents)
+        def record_step(_pipeline, step_index, timestep, callback_kwargs):
+            """Capture updated latents immediately after the scheduler step finishes.
+
+            `callback_kwargs["latents"]` has shape `(1, 16, 128, 128)` in bfloat16,
+            representing the raw scheduler state prior to VAE unscaling/unshifting.
+            """
+            completed = step_index + 1  # Convert 0-based loop index to 1-based completed count.
+            if completed in latent_steps:
+                percent = latent_steps[completed]
+                # Slice batch index 0 -> shape (16, 128, 128) on CPU.
                 tensors[f"latent_{percent:03d}"] = (
-                    callback_kwargs["latents"][0].detach().to("cpu").contiguous()
+                    callback_kwargs["latents"][0].detach().cpu().contiguous()
                 )
-
-                # Record exact step telemetry.
-                # `timestep.item()` extracts the scalar value from the 0D PyTorch tensor, and
-                # `float(...)` ensures it is a standard Python `float` for JSON serialization.
-                snapshots.append(
-                    {
-                        "requested_percent": percent,
-                        "completed_steps": completed,
-                        "actual_percent": 100.0 * completed / args.steps,
-                        "scheduler_timestep": float(timestep.item()),
-                    }
-                )
+                snapshots.append({
+                    "percent": percent,
+                    "completed_steps": completed,
+                    "latent_scheduler_timestep": float(timestep),
+                })
             return callback_kwargs
 
-        # ---------------------------------------------------------------------
-        # STEP 4C: Run SD3 Denoising Loop & VAE Decoding
-        # ---------------------------------------------------------------------
-        # `torch.inference_mode()` disables autograd engine overhead and view tracking,
-        # reducing memory footprint and accelerating forward-pass execution.
-        with torch.inference_mode():
-            # Pipeline execution details:
-            # 1. Encodes `prompt` (and an implicit empty negative prompt `""` for CFG) using
-            #    CLIP-L, CLIP-G, and T5-XXL.
-            # 2. Starts directly from `latents=initial` (shape `(1, 16, 128, 128)`), ensuring
-            #    the trajectory begins at the exact `latent_000` tensor we saved above.
-            # 3. Runs `args.steps` iterations of the MMDiT transformer + Euler flow-matching step,
-            #    calling `record_step` at the end of each iteration (`step_index = 0 .. args.steps-1`).
-            # 4. At the final step (`completed == args.steps`), `record_step` captures `latent_100`
-            #    (the final denoised latent before VAE decoding).
-            # 5. Because `output_type="pil"`, the pipeline then passes `latent_100` through the
-            #    SD3 VAE Decoder:
-            #      `z_scaled = (latents / vae.config.scaling_factor) + vae.config.shift_factor`
-            #    decoding `(1, 16, 128, 128)` -> `(1, 3, 1024, 1024)` in `[-1, 1]`, rescaling to
-            #    `[0, 255]`, permuting `NCHW -> NHWC`, and wrapping as a `PIL.Image.Image`.
-            # 6. `.images` is a Python `list` of length `batch_size = 1`.
-            #    Indexing `.images[0]` extracts the single `PIL.Image.Image` for batch item 0,
-            #    and `.convert("RGB")` guarantees a 3-channel 24-bit RGB image.
-            image = pipe(
-                prompt=prompt,
-                height=1024,
-                width=1024,
-                num_inference_steps=args.steps,
-                guidance_scale=args.guidance_scale,
-                generator=generator,
-                latents=initial,
-                callback_on_step_end=record_step,
-                callback_on_step_end_tensor_inputs=["latents"],
-                output_type="pil",
-            ).images[0].convert("RGB")
+        # 5e. Execute Diffusion Sampling with Hook Guaranteed to Clean Up
+        hook = blocks[args.block].register_forward_hook(capture_block)
+        try:
+            with torch.inference_mode():
+                # Pass pre-generated `initial` latents so `latent_000` matches step 0 identically.
+                image = pipe(
+                    prompt=sample["prompt"],
+                    height=1024,
+                    width=1024,
+                    num_inference_steps=args.steps,
+                    guidance_scale=args.guidance_scale,
+                    latents=initial,
+                    generator=generator,
+                    callback_on_step_end=record_step,
+                    callback_on_step_end_tensor_inputs=["latents"],
+                    output_type="pil",
+                ).images[0].convert("RGB")  # Guarantees 3-channel (1024, 1024, 3) RGB PIL image.
+        finally:
+            # Always detach the hook even on exception so hooks never accumulate across samples.
+            hook.remove()
 
-        # ---------------------------------------------------------------------
-        # STEP 4D: Convert Final RGB Image to Tensor & Validate All Shapes
-        # ---------------------------------------------------------------------
-        # Convert the `1024x1024` RGB PIL Image into a NumPy array:
-        # - Shape: `(1024, 1024, 3)` corresponding to Channels-Last `(Height, Width, Channels)`
-        #   where channel axis index 2 is ordered `[Red, Green, Blue]`.
-        # - Dtype: `np.uint8` (values `0` through `255`).
-        # - `copy=True` allocates a writable standalone buffer owned by NumPy.
-        rgb = np.array(image, dtype=np.uint8, copy=True)
-        if rgb.shape != (1024, 1024, 3):
-            raise RuntimeError(f"Unexpected image shape: {rgb.shape}")
+        # 5f. Post-Inference Integrity Checks
+        # Ensure the hook fired once per step and every expected tensor & snapshot was captured.
+        if hook_calls != args.steps or set(tensors) != expected_keys:
+            raise RuntimeError(f"Incomplete capture for {stem}: calls={hook_calls}, keys={sorted(tensors)}")
+        if len(snapshots) != len(LATENT_PERCENTAGES):
+            raise RuntimeError(f"Incomplete latent metadata for {stem}")
 
-        # Wrap the NumPy array as a CPU PyTorch tensor (`torch.uint8`, shape `(1024, 1024, 3)`).
-        # Note the layout distinction inside the `.safetensors` archive:
-        # - `latent_000` .. `latent_100`: Channels-First `(C, H, W)` = `(16, 128, 128)`, `float16`
-        # - `final_rgb`                 : Channels-Last  `(H, W, C)` = `(1024, 1024, 3)`, `uint8`
-        tensors["final_rgb"] = torch.from_numpy(rgb).contiguous()
-
-        # Verify that all 12 expected tensors are present:
-        # 1 initial latent (`latent_000`) + 10 decile latents (`latent_010`..`latent_100`) + 1 `final_rgb` = 12.
-        if len(tensors) != 12:
-            raise RuntimeError(f"Expected 12 tensors, got {list(tensors)}")
-
-        # Explicitly verify the exact shape tuple of every single tensor before writing to disk.
+        # Guard against NaN/Inf explosions in bfloat16 activations or latents.
         for key, value in tensors.items():
-            expected = (1024, 1024, 3) if key == "final_rgb" else latent_shape
-            if tuple(value.shape) != expected:
-                raise RuntimeError(f"{key} has shape {tuple(value.shape)}, expected {expected}")
+            if not torch.isfinite(value.float()).all():
+                raise RuntimeError(f"Non-finite values in {key} for {stem}")
 
-        # ---------------------------------------------------------------------
-        # STEP 4E: Assemble Provenance Metadata & Atomically Persist to Disk
-        # ---------------------------------------------------------------------
+        # Merge feature-capture timesteps into the matching percentage entries in `snapshots`.
+        for snapshot in snapshots:
+            percent = snapshot["percent"]
+            if percent in feature_timesteps:
+                snapshot["feature_scheduler_timestep"] = feature_timesteps[percent]
+
+        # 5g. Assemble Provenance Metadata Dictionary
         metadata = {
-            "prompt": prompt,
-            "prompt_index": index,
-            "seed": seed,
-            "model_id": MODEL_ID,
-            "scheduler": type(pipe.scheduler).__name__,  # Typically "FlowMatchEulerDiscreteScheduler"
-            "num_inference_steps": args.steps,
-            "guidance_scale": args.guidance_scale,
-            "latent_shape_chw": list(latent_shape),      # `[16, 128, 128]`
-            "latent_dtype": str(initial.dtype),          # `"torch.float16"`
-            "rgb_shape_hwc": list(rgb.shape),            # `[1024, 1024, 3]`
-            "rgb_dtype": "uint8",
-            "snapshots": snapshots,                      # List of 11 checkpoint telemetry dicts (0%..100%)
-            "software": {
-                "torch": torch.__version__,
-                "diffusers": __import__("diffusers").__version__,
-            },
+            **settings,
+            "dataset_version": "sd35-numeracy-smoke-v3",
+            "manifest_index": index,
+            "scheduler": type(pipe.scheduler).__name__,
+            "latent_shape_chw": list(latent_shape),  # [16, 128, 128]
+            "latent_representation": "scheduler_state_before_vae_scaling",
+            # Downstream decoders reconstructing images from saved latents must apply:
+            #   vae.decode((latent / scaling_factor) + shift_factor)
+            "vae_scaling_factor": float(pipe.vae.config.scaling_factor),
+            "vae_shift_factor": float(pipe.vae.config.shift_factor),
+            "feature_keys": [f"block{args.block:02d}_{p:03d}" for p in EARLY_PERCENTAGES],
+            "feature_shape_chw": list(tensors[f"block{args.block:02d}_000"].shape),  # [1536, 48, 48]
+            "feature_representation": "conditional CFG image tokens after transformer block; bilinear resized; no PCA",
+            "feature_step_semantics": "block feature before denoising step at given percent completed",
+            "snapshots": snapshots,
+            "image_shape_hwc": [image.height, image.width, 3],  # [1024, 1024, 3]
+            "software": {"torch": torch.__version__, "diffusers": __import__("diffusers").__version__},
         }
 
-        # Atomic Write Pattern for `.safetensors`:
-        # Each `.safetensors` file is ~9.2 MB (`11 * (16 * 128 * 128 * 2 bytes) + (1024 * 1024 * 3 * 1 byte)`).
-        # If the job is preempted or crashes mid-write while writing directly to `{stem}.safetensors`,
-        # a truncated/corrupted file would remain on disk.
-        # Writing first to `{stem}.partial.safetensors` and then calling `os.replace(temporary, tensor_path)`
-        # performs an atomic POSIX filesystem rename once the write is 100% flushed.
-        temporary = args.output_dir / f"{stem}.partial.safetensors"
-        save_file(tensors, str(temporary))
-        os.replace(temporary, tensor_path)
-
-        # Save the visual PNG and JSON metadata sidecar files.
-        image.save(png_path)
-        metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
-
-        # Log 1-based progress (`[1/15]`, `[2/15]`, ...) with `flush=True` for real-time SLURM output.
-        print(f"[{index + 1}/{len(prompts)}] saved {stem}: {prompt}", flush=True)
+        # 5h. Atomic Write via Temporary Partial Files
+        # Writing to `*.partial.*` and promoting with `os.replace` guarantees that a crash
+        # mid-write cannot leave half-written files under the final target paths.
+        tensor_tmp = cell_dir / f"{stem}.partial.safetensors"
+        png_tmp = cell_dir / f"{stem}.partial.png"
+        metadata_tmp = cell_dir / f"{stem}.partial.json"
+        save_file(tensors, str(tensor_tmp))
+        image.save(png_tmp, format="PNG")
+        metadata_tmp.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+        os.replace(tensor_tmp, tensor_path)
+        os.replace(png_tmp, png_path)
+        os.replace(metadata_tmp, metadata_path)
+        print(f"[{position}/{len(assigned)}] saved {stem}: {sample['prompt']}", flush=True)
 
 
 if __name__ == "__main__":

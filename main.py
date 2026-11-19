@@ -1,29 +1,52 @@
-import numpy as np
 from models.linear_model import LinearModel
 from models.deep_neural_network import DeepNeuralNetwork
 from models.convolutional_neural_network import ConvolutionalNeuralNetwork
 from dataset.diffusion_data_loader import BaseDataLoader, FlatDataLoader
 
-train_data_folder = "C:\\Users\\ben99\\Downloads\\sd3-numeracy-v2\\Results\\Train"
-test_data_folder = "C:\\Users\\ben99\\Downloads\\sd3-numeracy-v2\\Results\\Test"
-label_json_filepath = "C:\\Users\\ben99\\Downloads\\sd3-numeracy-v2\\Results\\sd3-numeracy-v2-backpacks-reviews.json"
+# Paths to cached PCA outputs produced by compute_pca_cache.py
+train_data_folder = "D:\\sd35-numeracy-v3-share\\PCA_Cache\\Train"
+test_data_folder = "D:\\sd35-numeracy-v3-share\\PCA_Cache\\Test"
+label_json_filepath = "D:\\sd35-numeracy-v3-share\\reviews.json"
 
-training_data = FlatDataLoader(train_data_folder, results_json_path=label_json_filepath, percent=90)
-# testing_data = FlatDataLoader(test_data_folder, results_json_path=label_json_filepath, percent=90)
-
-# training_data = BaseDataLoader(train_data_folder, results_json_path=label_json_filepath, percent=20)
-# testing_data = BaseDataLoader(test_data_folder, results_json_path=label_json_filepath, percent=20)
-
+# Choose one of the two loader/model setups:
+# 1) Flat loader for LinearModel or DeepNeuralNetwork
+training_data = FlatDataLoader(
+    train_data_folder,
+    percent=20,
+    results_json_path=label_json_filepath,
+)
 training_data.load_data()
+
+testing_data = FlatDataLoader(
+    test_data_folder,
+    percent=20,
+    results_json_path=label_json_filepath,
+    class_names=training_data.class_names,
+)
+testing_data.load_data()
+
+# 2) Spatial + metadata loader for ConvolutionalNeuralNetwork
+# training_data = BaseDataLoader(
+#     train_data_folder,
+#     percent=20,
+#     results_json_path=label_json_filepath,
+# )
+# training_data.load_data()
+#
+# testing_data = BaseDataLoader(
+#     test_data_folder,
+#     percent=20,
+#     results_json_path=label_json_filepath,
+#     class_names=training_data.class_names,
+# )
 # testing_data.load_data()
 
-# model = LinearModel()
+# model = LinearModel(C=0.01)
 model = DeepNeuralNetwork()
 # model = ConvolutionalNeuralNetwork()
 
-print(model.k_fold_val(10, training_data.data, training_data.labels))
+print("CV Accuracy:", model.k_fold_val(10, training_data.data, training_data.labels))
 
-# print(model.predict(testing_data.data))
-# print(model.score(testing_data.data, testing_data.labels))
-
-
+# Refit on the full training split before final held-out test evaluation
+# model.fit(training_data.data, training_data.labels)
+# print("Test Accuracy:", model.score(testing_data.data, testing_data.labels))
